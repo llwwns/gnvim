@@ -24,7 +24,9 @@ use ui::font::Font;
 use ui::grid::Grid;
 use ui::popupmenu::Popupmenu;
 use ui::tabline::Tabline;
+use ui::window::Window;
 
+type Windows = HashMap<u64, Window>;
 type Grids = HashMap<u64, Grid>;
 
 #[derive(Default)]
@@ -57,6 +59,9 @@ struct ResizeOptions {
 
 /// Internal structure for `UI` to work on.
 struct UIState {
+    windows: Windows,
+    /// Shared container for windows.
+    windows_container: gtk::Fixed,
     /// All grids currently in the UI.
     grids: Grids,
     /// Highlight definitions.
@@ -64,6 +69,7 @@ struct UIState {
     /// Mode infos. When a mode is activated, the activated mode is passed
     /// to the gird(s).
     mode_infos: Vec<ModeInfo>,
+    current_mode: Option<ModeInfo>,
     /// Id of the current active grid.
     current_grid: u64,
 
@@ -80,6 +86,9 @@ struct UIState {
     resize_source_id: Rc<RefCell<Option<glib::SourceId>>>,
     /// Resize options that is some if a resize should be send to nvim on flush.
     resize_on_flush: Option<ResizeOptions>,
+
+    font: Font,
+    line_space: i64,
 }
 
 /// Main UI structure.
@@ -112,6 +121,9 @@ impl UI {
         window.set_title("Neovim");
         window.set_default_size(1280, 720);
 
+        // Realize window resources.
+        window.realize();
+
         // Top level widget.
         let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
         window.add(&b);
@@ -119,12 +131,12 @@ impl UI {
         let tabline = Tabline::new(nvim.clone());
         b.pack_start(&tabline.get_widget(), false, false, 0);
 
-        // Our root widget.
+        // Our root widget for all grids/windows.
         let overlay = gtk::Overlay::new();
         b.pack_start(&overlay, true, true, 0);
 
-        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        overlay.add(&box_);
+        //let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        //overlay.add(&box_);
 
         // Create hl defs and initialize 0th element because we'll need to have
         // something that is accessible for the default grid that we're gonna
@@ -132,9 +144,18 @@ impl UI {
         let mut hl_defs = HlDefs::default();
         hl_defs.insert(0, Highlight::default());
 
+        let font = Font::from_guifont("Monospace:h12").unwrap();
+        let line_space = 0;
+
         // Create default grid.
-        let mut grid = Grid::new(1);
-        box_.pack_start(&grid.widget(), true, true, 0);
+        let mut grid = Grid::new(1, &window.get_window().unwrap(), font.clone(), line_space, 80, 30);
+        //box_.pack_start(&grid.widget(), true, true, 0);
+        overlay.add(&grid.widget());
+
+        let windows_container = gtk::Fixed::new();
+        gtk::WidgetExt::set_name(&windows_container, "WINDOWS COTNAINER");
+        //windows_container.set_name("WINDOWS CONTAINER");
+        overlay.add_overlay(&windows_container);
 
         // When resizing our window (main grid), we'll have to tell neovim to
         // resize it self also. The notify to nvim is send with a small delay,
@@ -278,6 +299,8 @@ impl UI {
             win: window,
             rx,
             state: Rc::new(RefCell::new(UIState {
+                windows: Windows::new(),
+                windows_container,
                 grids,
                 mode_infos: vec![],
                 current_grid: 1,
@@ -289,6 +312,9 @@ impl UI {
                 resize_source_id: source_id,
                 hl_defs,
                 resize_on_flush: None,
+                font,
+                line_space,
+                current_mode: None,
             })),
             nvim,
         }
@@ -426,7 +452,11 @@ fn handle_gnvim_event(
             state.cursor_tooltip.show(content.clone());
 
             let grid = state.grids.get(&state.current_grid).unwrap();
-            let rect = grid.get_rect_for_cell(*row, *col);
+            let mut rect = grid.get_rect_for_cell(*row, *col);
+
+            let window = state.windows.get(&state.current_grid).unwrap();
+            rect.x += window.x as i32;
+            rect.y += window.y as i32;
 
             state.cursor_tooltip.move_to(&rect);
         }
@@ -439,6 +469,10 @@ fn handle_gnvim_event(
         }
         GnvimEvent::PopupmenuWidthDetails(width) => {
             state.popupmenu.set_width_details(*width as i32);
+        }
+        GnvimEvent::DumpGrid => {
+            let grid = state.grids.get(&2).unwrap();
+            grid.dump_grid();
         }
         GnvimEvent::Unknown(msg) => {
             println!("Received unknown GnvimEvent: {}", msg);
@@ -477,11 +511,14 @@ fn handle_redraw_event(
                         let grid = if *grid_id != state.current_grid {
                             // ...so if the grid_id is not same as the state tells us,
                             // set the previous current grid to inactive state.
-                            state
+                            let grid = state
                                 .grids
                                 .get(&state.current_grid)
-                                .unwrap()
-                                .set_active(false);
+                                .unwrap();
+
+                            grid.set_active(false);
+                            grid.tick(); // Trick the grid to invalide the cursor's rect.
+
                             state.current_grid = *grid_id;
 
                             // And set the new current grid to active.
@@ -500,12 +537,29 @@ fn handle_redraw_event(
             RedrawEvent::GridResize(evt) => {
                 evt.iter().for_each(
                     |GridResize {
-                         grid,
+                         grid: id,
                          width,
                          height,
                      }| {
-                        let grid = state.grids.get(grid).unwrap();
-                        grid.resize(*width, *height);
+                        let win = window.get_window().unwrap();
+                        if let Some(grid) = state.grids.get(id) {
+                            grid.resize(&win, *width, *height);
+                        } else {
+                            let grid = Grid::new(
+                                *id,
+                                &window.get_window().unwrap(),
+                                state.font.clone(),
+                                state.line_space,
+                                *width as usize,
+                                *height as usize,
+                            );
+
+                            if let Some(ref mode) = state.current_mode {
+                                grid.set_mode(&mode);
+                            }
+                            grid.resize(&win, *width, *height);
+                            state.grids.insert(*id, grid);
+                        }
                     },
                 );
             }
@@ -563,6 +617,8 @@ fn handle_redraw_event(
                         let font =
                             Font::from_guifont(font).unwrap_or(Font::default());
 
+                        state.font = font.clone();
+
                         let mut opts =
                             state.resize_on_flush.take().unwrap_or_else(|| {
                                 let grid = state.grids.get(&1).unwrap();
@@ -577,6 +633,9 @@ fn handle_redraw_event(
                         state.resize_on_flush = Some(opts);
                     }
                     OptionSet::LineSpace(val) => {
+
+                        state.line_space = *val;
+
                         let mut opts =
                             state.resize_on_flush.take().unwrap_or_else(|| {
                                 let grid = state.grids.get(&1).unwrap();
@@ -603,6 +662,7 @@ fn handle_redraw_event(
             RedrawEvent::ModeChange(evt) => {
                 evt.iter().for_each(|ModeChange { index, .. }| {
                     let mode = state.mode_infos.get(*index as usize).unwrap();
+                    state.current_mode = Some(mode.clone());
                     // Broadcast the mode change to all grids.
                     // TODO(ville): It might be enough to just set the mode to the
                     //              current active grid.
@@ -622,13 +682,17 @@ fn handle_redraw_event(
                 }
 
                 if let Some(opts) = state.resize_on_flush.take() {
+                    let win = window.get_window().unwrap();
                     for grid in state.grids.values() {
                         grid.update_cell_metrics(
                             opts.font.clone(),
                             opts.line_space,
+                            &win,
                         );
                     }
 
+                    // TODO(ville): Use the root container to get the main grid's size and make
+                    // sure that it (the root contianer widget) has proper size.
                     let grid = state.grids.get(&1).unwrap();
                     let (cols, rows) = grid.calc_size();
 
@@ -667,8 +731,12 @@ fn handle_redraw_event(
                         .set_items(popupmenu.items.clone(), &state.hl_defs);
 
                     let grid = state.grids.get(&state.current_grid).unwrap();
-                    let rect =
+                    let mut rect =
                         grid.get_rect_for_cell(popupmenu.row, popupmenu.col);
+
+                    let window = state.windows.get(&popupmenu.grid).unwrap();
+                    rect.x += window.x as i32;
+                    rect.y += window.y as i32;
 
                     state.popupmenu.set_anchor(rect);
                     state.popupmenu.show();
@@ -769,6 +837,46 @@ fn handle_redraw_event(
                 evt.iter().for_each(|item| {
                     state.cmdline.wildmenu_select(*item);
                 });
+            }
+            RedrawEvent::WindowPos(evt) => {
+                evt.iter().for_each(|evt| {
+                    let win = window.get_window().unwrap();
+                    let windows_container = state.windows_container.clone();
+
+                    let grid = state.grids.get(&evt.grid).unwrap();
+                    let window =
+                        state.windows.entry(evt.grid).or_insert_with(|| {
+                            Window::new(evt.win, windows_container, &grid)
+                        });
+
+                    let grid_metrics =
+                        state.grids.get(&1).unwrap().get_grid_metrics();
+                    let x = evt.start_col * grid_metrics.cell_width;
+                    let y = evt.start_row * grid_metrics.cell_height;
+                    let width = evt.width * grid_metrics.cell_width;
+                    let height = evt.height * grid_metrics.cell_height;
+
+                    window.set_position(x, y, width, height);
+                    window.show();
+
+                    grid.resize(&win, evt.width, evt.height);
+                });
+            }
+            RedrawEvent::WindowHide(evt) => {
+                evt.iter().for_each(|grid_id| {
+                    state
+                        .windows
+                        .get(&grid_id)
+                        .unwrap()
+                        .hide();
+                })
+            }
+            RedrawEvent::WindowClose(evt) => {
+                evt.iter().for_each(|grid_id| {
+                    let win = state.windows.remove(&grid_id).unwrap();
+                    // TODO(ville): Make sure all resources are dropped from the window.
+                    win.hide();
+                })
             }
             RedrawEvent::Ignored(_) => (),
             RedrawEvent::Unknown(e) => {
