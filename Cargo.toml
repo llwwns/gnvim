@@ -35,6 +35,6 @@ version = "0.8"
 features = ["v2_14"]
 
 [dependencies.neovim-lib]
-#git = "https://github.com/vhakulinen/neovim-lib"
+git = "https://github.com/vhakulinen/neovim-lib"
+branch = "multigrid"
 #git = "https://github.com/daa84/neovim-lib"
-path = "../neovim-lib"
