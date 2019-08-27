@@ -26,8 +26,8 @@ use ui::popupmenu::Popupmenu;
 use ui::tabline::Tabline;
 use ui::window::Window;
 
-type Windows = HashMap<u64, Window>;
-type Grids = HashMap<u64, Grid>;
+type Windows = HashMap<i64, Window>;
+type Grids = HashMap<i64, Grid>;
 
 #[derive(Default)]
 pub struct HlDefs {
@@ -62,6 +62,7 @@ struct UIState {
     windows: Windows,
     /// Shared container for windows.
     windows_container: gtk::Fixed,
+    windows_float_container: gtk::Fixed,
     /// All grids currently in the UI.
     grids: Grids,
     /// Highlight definitions.
@@ -71,7 +72,7 @@ struct UIState {
     mode_infos: Vec<ModeInfo>,
     current_mode: Option<ModeInfo>,
     /// Id of the current active grid.
-    current_grid: u64,
+    current_grid: i64,
 
     popupmenu: Popupmenu,
     cmdline: Cmdline,
@@ -135,9 +136,6 @@ impl UI {
         let overlay = gtk::Overlay::new();
         b.pack_start(&overlay, true, true, 0);
 
-        //let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        //overlay.add(&box_);
-
         // Create hl defs and initialize 0th element because we'll need to have
         // something that is accessible for the default grid that we're gonna
         // make next.
@@ -148,14 +146,25 @@ impl UI {
         let line_space = 0;
 
         // Create default grid.
-        let mut grid = Grid::new(1, &window.get_window().unwrap(), font.clone(), line_space, 80, 30);
-        //box_.pack_start(&grid.widget(), true, true, 0);
+        let mut grid = Grid::new(
+            1,
+            &window.get_window().unwrap(),
+            font.clone(),
+            line_space,
+            80,
+            30,
+        );
         overlay.add(&grid.widget());
 
         let windows_container = gtk::Fixed::new();
-        gtk::WidgetExt::set_name(&windows_container, "WINDOWS COTNAINER");
-        //windows_container.set_name("WINDOWS CONTAINER");
+        gtk::WidgetExt::set_name(&windows_container, "Windows contianer");
+        let windows_float_container = gtk::Fixed::new();
+        gtk::WidgetExt::set_name(
+            &windows_float_container,
+            "Floating windows contianer",
+        );
         overlay.add_overlay(&windows_container);
+        overlay.add_overlay(&windows_float_container);
 
         // When resizing our window (main grid), we'll have to tell neovim to
         // resize it self also. The notify to nvim is send with a small delay,
@@ -301,6 +310,7 @@ impl UI {
             state: Rc::new(RefCell::new(UIState {
                 windows: Windows::new(),
                 windows_container,
+                windows_float_container,
                 grids,
                 mode_infos: vec![],
                 current_grid: 1,
@@ -349,7 +359,7 @@ impl UI {
                 Message::Notify(notify) => {
                     let mut state = state.borrow_mut();
 
-                    handle_notify(&win, &notify, &mut state, nvim.clone());
+                    handle_notify(&win, notify, &mut state, nvim.clone());
                 }
                 // Handle a request.
                 Message::Request(tx, request) => {
@@ -387,7 +397,7 @@ fn handle_request(
 
 fn handle_notify(
     window: &gtk::ApplicationWindow,
-    notify: &Notify,
+    notify: Notify,
     state: &mut UIState,
     nvim: Rc<RefCell<Neovim>>,
 ) {
@@ -416,7 +426,7 @@ fn handle_notify(
 }
 
 fn handle_gnvim_event(
-    event: &GnvimEvent,
+    event: GnvimEvent,
     state: &mut UIState,
     nvim: Rc<RefCell<Neovim>>,
 ) {
@@ -452,7 +462,7 @@ fn handle_gnvim_event(
             state.cursor_tooltip.show(content.clone());
 
             let grid = state.grids.get(&state.current_grid).unwrap();
-            let mut rect = grid.get_rect_for_cell(*row, *col);
+            let mut rect = grid.get_rect_for_cell(row, col);
 
             let window = state.windows.get(&state.current_grid).unwrap();
             rect.x += window.x as i32;
@@ -462,17 +472,13 @@ fn handle_gnvim_event(
         }
         GnvimEvent::CursorTooltipHide => state.cursor_tooltip.hide(),
         GnvimEvent::CursorTooltipSetStyle(style) => {
-            state.cursor_tooltip.set_style(style)
+            state.cursor_tooltip.set_style(&style)
         }
         GnvimEvent::PopupmenuWidth(width) => {
-            state.popupmenu.set_width(*width as i32);
+            state.popupmenu.set_width(width as i32);
         }
         GnvimEvent::PopupmenuWidthDetails(width) => {
-            state.popupmenu.set_width_details(*width as i32);
-        }
-        GnvimEvent::DumpGrid => {
-            let grid = state.grids.get(&2).unwrap();
-            grid.dump_grid();
+            state.popupmenu.set_width_details(width as i32);
         }
         GnvimEvent::Unknown(msg) => {
             println!("Received unknown GnvimEvent: {}", msg);
@@ -482,11 +488,11 @@ fn handle_gnvim_event(
 
 fn handle_redraw_event(
     window: &gtk::ApplicationWindow,
-    events: &Vec<RedrawEvent>,
+    events: Vec<RedrawEvent>,
     state: &mut UIState,
     nvim: Rc<RefCell<Neovim>>,
 ) {
-    for event in events {
+    for event in events.into_iter() {
         match event {
             RedrawEvent::SetTitle(evt) => {
                 evt.iter().for_each(|title| {
@@ -511,10 +517,8 @@ fn handle_redraw_event(
                         let grid = if *grid_id != state.current_grid {
                             // ...so if the grid_id is not same as the state tells us,
                             // set the previous current grid to inactive state.
-                            let grid = state
-                                .grids
-                                .get(&state.current_grid)
-                                .unwrap();
+                            let grid =
+                                state.grids.get(&state.current_grid).unwrap();
 
                             grid.set_active(false);
                             grid.tick(); // Trick the grid to invalide the cursor's rect.
@@ -567,6 +571,17 @@ fn handle_redraw_event(
                 evt.iter().for_each(|grid| {
                     let grid = state.grids.get(grid).unwrap();
                     grid.clear(&state.hl_defs);
+                });
+            }
+            RedrawEvent::GridDestroy(evt) => {
+                evt.iter().for_each(|grid| {
+                    println!("DROP GRID {}", grid);
+                    // TODO(ville): Make sure all grid resources are freed.
+                    state.grids.remove(grid).unwrap(); // Drop grid.
+
+                    // Make the current grid to point to the default grid. We relay on the fact
+                    // that current_grid is always pointing to a existing grid.
+                    state.current_grid = 1;
                 });
             }
             RedrawEvent::GridScroll(evt) => {
@@ -633,7 +648,6 @@ fn handle_redraw_event(
                         state.resize_on_flush = Some(opts);
                     }
                     OptionSet::LineSpace(val) => {
-
                         state.line_space = *val;
 
                         let mut opts =
@@ -673,7 +687,7 @@ fn handle_redraw_event(
             }
             RedrawEvent::SetBusy(busy) => {
                 for grid in state.grids.values() {
-                    grid.set_busy(*busy);
+                    grid.set_busy(busy);
                 }
             }
             RedrawEvent::Flush() => {
@@ -839,14 +853,18 @@ fn handle_redraw_event(
                 });
             }
             RedrawEvent::WindowPos(evt) => {
-                evt.iter().for_each(|evt| {
+                evt.into_iter().for_each(|evt| {
                     let win = window.get_window().unwrap();
                     let windows_container = state.windows_container.clone();
 
                     let grid = state.grids.get(&evt.grid).unwrap();
                     let window =
                         state.windows.entry(evt.grid).or_insert_with(|| {
-                            Window::new(evt.win, windows_container, &grid)
+                            Window::new(
+                                evt.win.clone(),
+                                windows_container,
+                                &grid,
+                            )
                         });
 
                     let grid_metrics =
@@ -862,21 +880,56 @@ fn handle_redraw_event(
                     grid.resize(&win, evt.width, evt.height);
                 });
             }
+            RedrawEvent::WindowFloatPos(evt) => {
+                evt.iter().for_each(|evt| {
+                    let anchor_grid =
+                        state.grids.get(&evt.anchor_grid).unwrap();
+
+                    let (x_offset, y_offset) = {
+                        let anchor_window =
+                            state.windows.get(&evt.anchor_grid).unwrap();
+                        (anchor_window.x, anchor_window.y)
+                    };
+
+                    let grid = state.grids.get(&evt.grid).unwrap();
+                    let windows_float_container =
+                        state.windows_float_container.clone();
+                    let window =
+                        state.windows.entry(evt.grid).or_insert_with(|| {
+                            println!("Create new float window");
+                            Window::new(
+                                evt.win.clone(),
+                                windows_float_container,
+                                &grid,
+                            )
+                        });
+
+                    // TODO(ville): Move window from possible container to float container.
+
+                    let anchor_metrics = anchor_grid.get_grid_metrics();
+                    let grid_metrics = grid.get_grid_metrics();
+
+                    let x =
+                        x_offset + anchor_metrics.cell_width * evt.anchor_col;
+                    let y =
+                        y_offset + anchor_metrics.cell_height * evt.anchor_row;
+                    let width = grid_metrics.cols * grid_metrics.cell_width;
+                    let height = grid_metrics.rows * grid_metrics.cell_height;
+
+                    window.set_position(x, y, width, height);
+                    window.show();
+                });
+            }
             RedrawEvent::WindowHide(evt) => {
                 evt.iter().for_each(|grid_id| {
-                    state
-                        .windows
-                        .get(&grid_id)
-                        .unwrap()
-                        .hide();
-                })
+                    state.windows.get(&grid_id).unwrap().hide();
+                });
             }
             RedrawEvent::WindowClose(evt) => {
                 evt.iter().for_each(|grid_id| {
-                    let win = state.windows.remove(&grid_id).unwrap();
                     // TODO(ville): Make sure all resources are dropped from the window.
-                    win.hide();
-                })
+                    state.windows.remove(&grid_id).unwrap(); // Drop window.
+                });
             }
             RedrawEvent::Ignored(_) => (),
             RedrawEvent::Unknown(e) => {
