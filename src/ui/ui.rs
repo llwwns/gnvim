@@ -59,9 +59,11 @@ struct ResizeOptions {
 
 /// Internal structure for `UI` to work on.
 struct UIState {
+    css_provider: gtk::CssProvider,
     windows: Windows,
-    /// Shared container for windows.
+    /// Container for non-floating windows.
     windows_container: gtk::Fixed,
+    /// Container for floating windows.
     windows_float_container: gtk::Fixed,
     /// All grids currently in the UI.
     grids: Grids,
@@ -70,6 +72,7 @@ struct UIState {
     /// Mode infos. When a mode is activated, the activated mode is passed
     /// to the gird(s).
     mode_infos: Vec<ModeInfo>,
+    /// Current mode.
     current_mode: Option<ModeInfo>,
     /// Id of the current active grid.
     current_grid: i64,
@@ -304,10 +307,14 @@ impl UI {
         let mut grids = HashMap::new();
         grids.insert(1, grid);
 
+        let css_provider = gtk::CssProvider::new();
+        add_css_provider!(&css_provider, window);
+
         UI {
             win: window,
             rx,
             state: Rc::new(RefCell::new(UIState {
+                css_provider,
                 windows: Windows::new(),
                 windows_container,
                 windows_float_container,
@@ -619,6 +626,14 @@ fn handle_redraw_event(
                     }
 
                     state.cursor_tooltip.set_colors(*fg, *bg);
+
+                    // Set the background for our main window.
+                    CssProviderExt::load_from_data(
+                        &state.css_provider,
+                        format!("* {{
+                            background: #{bg};
+                        }}", bg=bg.to_hex()).as_bytes(),
+                    ).unwrap();
                 });
             }
             RedrawEvent::HlAttrDefine(evt) => {
